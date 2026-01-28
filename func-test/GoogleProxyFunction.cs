@@ -16,8 +16,10 @@ public class GoogleProxyFunction
     }
 
     [Function("GoogleProxy")]
-    public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
+public async Task<HttpResponseData> Run(
+    [HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
+{
+    try
     {
         _logger.LogInformation("Calling google.ie");
 
@@ -27,7 +29,16 @@ public class GoogleProxyFunction
         var response = req.CreateResponse(HttpStatusCode.OK);
         response.Headers.Add("Content-Type", "text/html; charset=utf-8");
         await response.WriteStringAsync(content);
-
         return response;
     }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "GoogleProxy failed");
+
+        var error = req.CreateResponse(HttpStatusCode.InternalServerError);
+        await error.WriteStringAsync(ex.Message);
+        return error;
+    }
+}
+
 }
