@@ -1,8 +1,19 @@
-using System.Net;
-using Microsoft.Azure.Functions.Worker;
-using Microsoft.Azure.Functions.Worker.Http;
-using Microsoft.Extensions.Logging;
+using System;
 using System.Net.Http;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+
+using Azure;
+using Azure.Identity;
+using Azure.Security.KeyVault.Secrets;
+using Azure.Data.Tables;
+using Microsoft.Azure.Functions.Worker.Extensions.Timer;
+using System.Text.Json;
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using Azure.Core;
+
 
 public class GoogleProxyFunction
 {
@@ -16,29 +27,87 @@ public class GoogleProxyFunction
     }
 
     [Function("GoogleProxy")]
-public async Task<HttpResponseData> Run(
-    [HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
-{
-    try
-    {
-        _logger.LogInformation("Calling google.ie");
+    public async Task RunAsync([TimerTrigger("0 */1 * * * *")] TimerInfo timer)
 
-        var googleResponse = await _httpClient.GetAsync("https://www.google.ie");
-        var content = await googleResponse.Content.ReadAsStringAsync();
+        {
+            _logger.LogInformation("Sync started at {time}", DateTime.UtcNow);
 
-        var response = req.CreateResponse(HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "text/html; charset=utf-8");
-        await response.WriteStringAsync(content);
-        return response;
+            var credential = new DefaultAzureCredential();
+            var token = await credential.GetTokenAsync(
+                new TokenRequestContext(new[] { "https://storage.azure.com/.default" }));
+
+            _logger.LogInformation("Storage token acquired, expires {time}", token.ExpiresOn);
+
+            // ----- Key Vault -----
+            var kvName = Environment.GetEnvironmentVariable("KEYVAULT_NAME");
+            var secretClient = new SecretClient(
+                new Uri($"https://{kvName}.vault.azure.net"),
+                credential);
+
+            var apiKey = (await secretClient.GetSecretAsync("nasa-key")).Value.Value;
+
+            // ----- Table Storage -----
+            var storageAccount = Environment.GetEnvironmentVariable("STORAGE_ACCOUNT");
+            var tableService = new TableServiceClient(
+                Environment.GetEnvironmentVariable("AzureWebJobsStorage"));
+
+
+            var controlTable = tableService.GetTableClient("ControlTable");
+            var dataTable = tableService.GetTableClient("DataTable");
+
+            
+            // ----- Read lastSync -----
+            string lastSync;
+            try
+            {
+                var entity = await controlTable.GetEntityAsync<TableEntity>(
+                    "SYNC", "API");
+
+                lastSync = entity.Value.GetString("LastSync");
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404)
+            {
+                lastSync = "1970-01-01T00:00:00Z";
+            }
+
+            // ----- Call external API -----
+            var apiUrl = Environment.GetEnvironmentVariable("API_BASE_URL");
+            var requestUrl = $"{apiUrl}?api_key={apiKey}&since={Uri.EscapeDataString(lastSync)}";
+
+            var response = await _httpClient.GetAsync(requestUrl);
+            response.EnsureSuccessStatusCode();
+
+            var content = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(content);
+            var root = doc.RootElement;
+
+            // Get the "element_count" field
+            int elementCount = root.GetProperty("element_count").GetInt32();
+
+            // ----- Save result (outbox) -----
+            var dataEntity = new TableEntity("API_DATA", Guid.NewGuid().ToString())
+            {
+                { "ElementCount", elementCount },
+                { "CreatedAt", DateTime.UtcNow }
+            };
+
+            await dataTable.UpsertEntityAsync(dataEntity);
+
+            // ----- Update control table -----
+            var newSync = DateTime.UtcNow.ToString("O");
+
+            await controlTable.UpsertEntityAsync(new TableEntity("SYNC", "API")
+            {
+                { "LastSync", newSync }
+            });
+
+            _logger.LogInformation("Sync completed at {time}", newSync);
+        }
     }
-    catch (Exception ex)
+
+    public class ApiItem
     {
-        _logger.LogError(ex, "GoogleProxy failed");
-
-        var error = req.CreateResponse(HttpStatusCode.InternalServerError);
-        await error.WriteStringAsync(ex.Message);
-        return error;
+        public string Id { get; set; }
+        // add other fields as needed
     }
-}
 
-}
